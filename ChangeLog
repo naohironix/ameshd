@@ -1,0 +1,29 @@
+2011-03-27  Naohiro Nishikawa  <naohironix@gmail.com>
+
+	* Release 0.2.0
+
+	* Add sending mail as one of notification method.
+
+2011-03-26  Naohiro Nishikawa  <naohironix@gmail.com>
+
+	* Count the rainfall in the region.
+
+	* Add threshold of the rainfall to gain the level to one in
+	  order to remove a noise.
+	
+	* Convert shadow to an appreciate value, use a left-upper
+	  value of a shadow minus one.
+
+	* Add test option for the development.
+
+
+2011-03-25  Naohiro Nishikawa  <naohironix@gmail.com>
+
+	* Introduce command line options and add usage, version and
+  	  debug option and their facility.
+
+	* Adjust polling time to get a rain map as soon as possible
+
+2011-03-24  Naohiro Nishikawa  <naohironix@gmail.com>
+
+	* initial release 0.1.0
