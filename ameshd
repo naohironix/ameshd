@@ -1,0 +1,243 @@
+#!/usr/bin/env gosh
+;; -*- Mode: Scheme; -*-
+;;
+;; ameshd is a program that does polling Tokyo Amesh Server on every five
+;; minutes and notify it if it is raining at a specified region.
+;;
+;; Copyright (c) 2011 Naohiro Nishikawa, All rights reserved.
+;;
+;; Redistribution and use in source and binary forms, with or without
+;; modification, are permitted provided that the following conditions are met:
+;;
+;;  1. Redistributions of source code must retain the above copyright notice,
+;;     this list of conditions and the following disclaimer.
+;;  2. Redistributions in binary form must reproduce the above copyright
+;;     notice, this list of conditions and the following disclaimer in the
+;;     documentation and/or other materials provided with the distribution.
+;;
+;; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDER "AS IS" AND ANY EXPRESS OR
+;; IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+;; MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO
+;; EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
+;; INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+;; (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+;; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+;; ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+;; (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+;; THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+(use srfi-19)
+(use rfc.http)
+(use gauche.parseopt)
+(use gauche.uvector)
+
+;;
+;; Configurable variables
+;;
+(define position-x 139.766865) ;; Tokyo station
+(define position-y 35.681004)  ;; Tokyo station
+(define radius 20000) ;; 20000 meter
+(define ameshd-dir "/Users/naohiro/.ameshd/")
+(define enable-growl-notify #t)
+(define growl-command "growlnotify")
+(define growl-icon "") ;; not yet
+(define growl-icon-level1 "") ;; not yet
+(define growl-icon-level2 "") ;; not yet
+(define growl-icon-level3 "") ;; not yet
+(define growl-icon-level4 "") ;; not yet
+(define growl-icon-level5 "") ;; not yet
+(define growl-icon-level6 "") ;; not yet
+(define growl-icon-level7 "") ;; not yet
+(define growl-icon-level8 "") ;; not yet
+(define enable-browser-notify #f)
+(define browser-command "open")
+(define enable-mail-notify #f) ;; not yet
+(define mail-command "mail") ;; not yet
+(define mail-notify-time '(10 . 24)) ;; not yet
+(define notify-at-start #f) ;; not yet
+(define notify-on-level-change-higher #f) ;; not yet
+(define notify-on-level-change-zero #f) ;; not yet
+
+(define amesh-north 36.253133)
+(define amesh-south 35.099687)
+(define amesh-west 138.202515)
+(define amesh-east 140.570068)
+(define amesh-image-x-pixel 770)
+(define amesh-image-y-pixel 480)
+;; 6378150*cos(35/180*pi)*2*pi/360 -> 91159.161
+(define xd-per-degree 91159.161)
+;; 2*pi*6378150/360 -> 111263.283
+(define yd-per-degree 111263.283)
+
+(define amesh-xd-per-pixel
+  (/ (* xd-per-degree (- amesh-east amesh-west)) amesh-image-x-pixel))
+(define amesh-yd-per-pixel
+  (/ (* yd-per-degree (- amesh-north amesh-south)) amesh-image-y-pixel))
+(define position-pixel-x
+  (round->exact (* (- position-x amesh-west)
+		     (/ amesh-image-x-pixel (- amesh-east amesh-west)))))
+(define position-pixel-y
+  (round->exact (* (- amesh-north position-y)
+		   (/ amesh-image-y-pixel (- amesh-north amesh-south)))))
+(define radius-pixel-x (round->exact (/ radius amesh-xd-per-pixel)))
+(define radius-pixel-y (round->exact (/ radius amesh-yd-per-pixel)))
+(define amesh-server "tokyo-ame.jwa.or.jp")
+(define amesh-image-path "/mesh/000/")
+
+(define rgb-uvector
+	(make-u8vector (* amesh-image-x-pixel amesh-image-y-pixel 3)))
+(define rain-uvector
+	(make-u8vector (* amesh-image-x-pixel amesh-image-y-pixel)))
+
+(define (get-amesh-image file)
+  (string=? (call-with-output-file file
+	      (lambda (out)
+		(http-get amesh-server
+			  (string-append amesh-image-path (sys-basename file))
+			  :sink out :flusher (lambda _ #t))))
+	    "200"))
+
+(define (convert-gif-to-rgb gif-file rgb-file)
+  (sys-system (format "gif2rgb -1 -o ~a ~a" rgb-file gif-file)))
+
+(define (read-rgb-to-uvec rgb-file uvec)
+  (call-with-input-file rgb-file
+      (lambda (in)
+	(read-block! uvec in))))
+
+(define (write-uvec-to-file uvec file)
+  (call-with-output-file file
+    (lambda (out)
+      (write-block uvec out))))
+
+(define (rgb-to-rain-level rgb)
+  (cond ((= rgb #xccffff) 1)
+	((= rgb #x6699ff) 2)
+	((= rgb #x3333ff) 3)
+	((= rgb #x00ff00) 4)
+	((= rgb #xffff00) 5)
+	((= rgb #xff9900) 6)
+	((= rgb #xff00ff) 7)
+	((= rgb #xff0000) 8)
+	(else 0)))
+
+(define amesh-rain-level-word-ja
+  '((0 . "無雨")
+    (1 . "弱い雨")
+    (2 . "並の雨")
+    (3 . "やや強い雨")
+    (4 . "強い雨")
+    (5 . "やや激しい雨")
+    (6 . "激しい雨")
+    (7 . "非常に激しい雨")
+    (8 . "猛烈な雨")))
+
+(define message-start-rain-ja "半径~dkmで雨が降り出しました。~aです。")
+(define message-stop-rain-ja "半径~dkmで雨が止みました。")
+(define message-change-rain-higher-ja "半径~dkmで雨が強くなりました。~aです。")
+(define message-change-rain-lower-ja "半径~dkmで雨が弱くなりました。~aです。")
+
+(define (make-start-message r max)
+  (format message-start-rain-ja
+	  r (cdr (assq max amesh-rain-level-word-ja))))
+
+(define (make-stop-message r)
+  (format message-stop-rain-ja r))
+
+(define (make-change-higher-message r max)
+  (format message-change-rain-higher-ja
+	  r (cdr (assq max amesh-rain-level-word-ja))))
+
+(define (make-change-lower-message r max)
+  (format message-change-rain-lower-ja
+	  r (cdr (assq max amesh-rain-level-word-ja))))
+
+(define (convert-rgb-to-rain-level rgb-uvec rain-uvec)
+  (let ((size (uvector-size rain-uvec)))
+    (let loop ((i 0))
+      (if (< i size)
+	  (begin
+	    (u8vector-set! rain-uvec i 
+			   (rgb-to-rain-level
+			    (+ (ash (u8vector-ref rgb-uvec (* i 3)) 16)
+			       (ash (u8vector-ref rgb-uvec (+ (* i 3) 1)) 8)
+			       (u8vector-ref rgb-uvec (+ (* i 3) 2)))))
+	    (loop (+ i 1)))))))
+
+(define (rain-ref x y)
+  (if (or (< x 0) (>= x amesh-image-x-pixel)
+	  (< y 0) (>= y amesh-image-y-pixel))
+      0
+      (u8vector-ref rain-uvector (+ (* y amesh-image-x-pixel) x))))
+
+(define (check-rain-circle x y r)
+  (define (check-rain-vertical x yh yl max)
+    (if (< yh yl)
+	(let1 nmax (rain-ref x yh)
+	      (if (> nmax max)
+		  (check-rain-vertical x (+ yh 1) yl nmax)
+		  (check-rain-vertical x (+ yh 1) yl max)))
+	max))
+  (define (check-rain-circle1 cx y r x max)
+    (if (< cx (+ x r))
+	(let* ((yd  (round->exact (sqrt (- (* r r)  (* (- cx x) (- cx x))))))
+		 (nmax (check-rain-vertical cx (- y yd) (+ y yd) max)))
+	  (if (> nmax max)
+	      (check-rain-circle1 (+ cx 1) y r x nmax)
+	      (check-rain-circle1 (+ cx 1) y r x max)))
+	max))
+  (check-rain-circle1 (- x r) y r x 0))
+
+(define (make-basename date)
+  (date->string date "~Y~m~d~H~M"))
+
+(define (make-filename file suffix)
+  (string-append ameshd-dir file suffix))
+
+(define (send-notify mes)
+  (if enable-growl-notify
+      (sys-system
+       (format "~a -t ameshd -m \"~a\""
+	       growl-command mes)))
+  (if enable-browser-notify
+      (sys-system (format "~a ~a" browser-command
+			  (string-append "http://" amesh-server)))))
+
+(define (ameshd)
+  (define (ameshd first plevel)
+    (let* ((ct (current-time))
+	   (cd (time-utc->date ct (* 9 60 60))) ;; JST(+9)
+	   (min (slot-ref cd 'minute)))
+      (slot-set! cd 'minute (- min (modulo min 5)))
+      (let ((file (make-basename cd)))
+	(let loop1 ((wait 3))
+	  (when (= wait 0)
+		(display "Can't get a rain map.\n")
+		(sys-remove (make-filename file ".gif")) (exit 1))
+	  (if (not (get-amesh-image (make-filename file ".gif")))
+	      (begin (sys-sleep 10) (loop1 (- wait 1)))))
+	(convert-gif-to-rgb (make-filename file ".gif") (make-filename file ".rgb"))
+	(read-rgb-to-uvec (make-filename file ".rgb") rgb-uvector)
+	(sys-remove (make-filename file ".gif"))
+	(sys-remove (make-filename file ".rgb"))
+	(convert-rgb-to-rain-level rgb-uvector rain-uvector)
+	(let ((level (check-rain-circle position-pixel-x
+					position-pixel-y radius-pixel-x)))
+	  (if (= plevel 0)
+	      (when (< 0 level)
+		    (send-notify (make-start-message (/ radius 1000) level)))
+	      (if (= 0 level)
+		  (send-notify (make-stop-message (/ radius 1000)))
+		  (begin
+		    (when (< plevel level)
+			  (send-notify (make-change-higher-message (/ radius 1000)
+								   level)))
+		    (when (> plevel level)
+			  (send-notify (make-change-lower-message (/ radius 1000)
+								  level))))))
+	  (sys-sleep 300)
+	  (ameshd #f level)))))
+  (ameshd #t 0))
+
+(define (main args)
+  (ameshd))
