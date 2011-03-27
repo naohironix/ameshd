@@ -1,6 +1,6 @@
 
 ameshd is a program that does polling Tokyo Amesh Server on every five minutes
-and notify it if it is raining at a specified region.
+and notify it if it is raining at the specified region.
 
 Visit http://www.rhymester.net/~naohiro/ameshd/ for more details.
 

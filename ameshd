@@ -2,7 +2,7 @@
 ;; -*- Mode: Scheme; -*-
 ;;
 ;; ameshd is a program that does polling Tokyo Amesh Server on every five
-;; minutes and notify it if it is raining at a specified region.
+;; minutes and notify it if it is raining at the specified region.
 ;;
 ;; Copyright (c) 2011 Naohiro Nishikawa, All rights reserved.
 ;;
@@ -30,15 +30,16 @@
 (use rfc.http)
 (use gauche.parseopt)
 (use gauche.uvector)
+(use gauche.charconv)
 
 ;;
 ;; Configurable variables
 ;;
 (define position-x 139.766865) ;; Tokyo station
 (define position-y 35.681004)  ;; Tokyo station
-(define radius 20000) ;; 20000 meter
-(define ameshd-dir "/Users/naohiro/.ameshd/")
-(define enable-growl-notify #t)
+(define radius 20000) ;; 20 km
+(define ameshd-dir "/Users/you/.ameshd/")
+(define growl-notify-enable #t)
 (define growl-command "growlnotify")
 (define growl-icon "") ;; not yet
 (define growl-icon-level1 "") ;; not yet
@@ -49,15 +50,19 @@
 (define growl-icon-level6 "") ;; not yet
 (define growl-icon-level7 "") ;; not yet
 (define growl-icon-level8 "") ;; not yet
-(define enable-browser-notify #f)
+(define browser-notify-enable #f)
 (define browser-command "open")
-(define enable-mail-notify #f) ;; not yet
-(define mail-command "mail") ;; not yet
-(define mail-notify-time '(10 . 24)) ;; not yet
-(define notify-at-start #f) ;; not yet
+(define mail-notify-enable #f)
+(define mail-command "mail")
+(define mail-subject "ameshd")
+(define mail-to "you@mail")
+(define mail-notify-time '(10 . 24))
+(define notify-at-program-start #t)
 (define notify-on-level-change-higher #f) ;; not yet
-(define notify-on-level-change-zero #f) ;; not yet
+(define notify-on-level-change-lower #f) ;; not yet
+(define notify-rainfall-threshold 5)
 
+(define *ameshd-version* "0.2.0")
 (define amesh-north 36.253133)
 (define amesh-south 35.099687)
 (define amesh-west 138.202515)
@@ -119,6 +124,7 @@
 	((= rgb #xff9900) 6)
 	((= rgb #xff00ff) 7)
 	((= rgb #xff0000) 8)
+	((= rgb #x000000) -1)
 	(else 0)))
 
 (define amesh-rain-level-word-ja
@@ -155,14 +161,17 @@
 (define (convert-rgb-to-rain-level rgb-uvec rain-uvec)
   (let ((size (uvector-size rain-uvec)))
     (let loop ((i 0))
-      (if (< i size)
-	  (begin
-	    (u8vector-set! rain-uvec i 
-			   (rgb-to-rain-level
-			    (+ (ash (u8vector-ref rgb-uvec (* i 3)) 16)
-			       (ash (u8vector-ref rgb-uvec (+ (* i 3) 1)) 8)
-			       (u8vector-ref rgb-uvec (+ (* i 3) 2)))))
-	    (loop (+ i 1)))))))
+      (when (< i size)
+	    (let1 level (rgb-to-rain-level
+			 (+ (ash (u8vector-ref rgb-uvec (* i 3)) 16)
+			    (ash (u8vector-ref rgb-uvec (+ (* i 3) 1)) 8)
+			    (u8vector-ref rgb-uvec (+ (* i 3) 2))))
+		  (u8vector-set! rain-uvec i 
+				 (if (and (< level 0) (> i amesh-image-x-pixel))
+				     (- (u8vector-ref rain-uvec
+						      (- i amesh-image-x-pixel 1)) 1)
+				     level)))
+	    (loop (+ i 1))))))
 
 (define (rain-ref x y)
   (if (or (< x 0) (>= x amesh-image-x-pixel)
@@ -171,22 +180,23 @@
       (u8vector-ref rain-uvector (+ (* y amesh-image-x-pixel) x))))
 
 (define (check-rain-circle x y r)
-  (define (check-rain-vertical x yh yl max)
+  (define (check-rain-vertical x yh yl max sum)
     (if (< yh yl)
 	(let1 nmax (rain-ref x yh)
 	      (if (> nmax max)
-		  (check-rain-vertical x (+ yh 1) yl nmax)
-		  (check-rain-vertical x (+ yh 1) yl max)))
-	max))
-  (define (check-rain-circle1 cx y r x max)
+		  (check-rain-vertical x (+ yh 1) yl nmax (+ sum nmax))
+		  (check-rain-vertical x (+ yh 1) yl max (+ sum nmax))))
+	(values max sum)))
+  (define (check-rain-circle1 cx y r x max sum)
     (if (< cx (+ x r))
-	(let* ((yd  (round->exact (sqrt (- (* r r)  (* (- cx x) (- cx x))))))
-		 (nmax (check-rain-vertical cx (- y yd) (+ y yd) max)))
-	  (if (> nmax max)
-	      (check-rain-circle1 (+ cx 1) y r x nmax)
-	      (check-rain-circle1 (+ cx 1) y r x max)))
-	max))
-  (check-rain-circle1 (- x r) y r x 0))
+	(let ((yd  (round->exact (sqrt (- (* r r)  (* (- cx x) (- cx x)))))))
+	  (receive (nmax sum)
+		   (check-rain-vertical cx (- y yd) (+ y yd) max sum)
+		   (if (> nmax max)
+		       (check-rain-circle1 (+ cx 1) y r x nmax sum)
+		       (check-rain-circle1 (+ cx 1) y r x max sum))))
+	(values max sum)))
+  (check-rain-circle1 (- x r) y r x 0 0))
 
 (define (make-basename date)
   (date->string date "~Y~m~d~H~M"))
@@ -194,50 +204,115 @@
 (define (make-filename file suffix)
   (string-append ameshd-dir file suffix))
 
-(define (send-notify mes)
-  (if enable-growl-notify
-      (sys-system
-       (format "~a -t ameshd -m \"~a\""
-	       growl-command mes)))
-  (if enable-browser-notify
-      (sys-system (format "~a ~a" browser-command
-			  (string-append "http://" amesh-server)))))
+(define *debug* #f)
+
+(define (debug-init)
+  (print "Enable debug")
+  (set! *debug* #t))
+
+(define (log fmt . var)
+  (when *debug* (apply format #t fmt var) (flush)))
+
+(define (send-mail to subject message)
+  (let1 tmp-file (string-append ameshd-dir "mail-tmp")
+	(call-with-output-file
+	    tmp-file (lambda (out) (display message out)))
+	(sys-system (format "cat ~a|~a -s ~a ~a"
+			    tmp-file
+			    mail-command subject to))
+	(sys-remove tmp-file)))
+
+(define (send-notify event level)
+  (let ((growl growl-notify-enable)
+	(browser browser-notify-enable)
+	(mail (and mail-notify-enable
+		   (let1 hour (date-hour (current-date))
+			 (and (<= (car mail-notify-time) hour)
+			      (>= (cdr mail-notify-time) hour)))))
+	(message ""))
+    (cond ((eq? 'start event)
+	   (set! message (make-start-message (/ radius 1000) level)))
+	  ((eq? 'change-higher event)
+	   (set! message (make-change-higher-message (/ radius 1000) level))
+	   (set! browser #f)
+	   (set! mail #f))
+	  ((eq? 'change-lower event)
+	   (set! message (make-change-lower-message (/ radius 1000) level))
+	   (set! browser #f)
+	   (set! mail #f))
+	  ((eq? 'stop event)
+	   (set! message (make-stop-message (/ radius 1000)))))
+    (when growl
+	  (sys-system (format "~a -t ameshd -m \"~a\"" growl-command message)))
+    (when browser
+	  (sys-system (format "~a ~a" browser-command
+			      (string-append "http://" amesh-server))))
+    (when mail 
+	  (send-mail mail-to mail-subject 
+		     (ces-convert message "UTF-8" "ISO2022JP")))
+    (log "send-notify: ~a\n" message)))
+
+(define (amesh-test gif-file)
+  (let1 rgb-file (string-append (car (string-split gif-file #\.)) ".rgb")
+	(convert-gif-to-rgb gif-file rgb-file)
+	(read-rgb-to-uvec rgb-file rgb-uvector)
+	(sys-remove rgb-file)
+	(convert-rgb-to-rain-level rgb-uvector rain-uvector)
+	(receive
+	 (level sum) (check-rain-circle position-pixel-x
+					position-pixel-y radius-pixel-x)
+	 (format #t "level ~d rainfall ~d\n" level sum))))
 
 (define (ameshd)
-  (define (ameshd first plevel)
+  (define (ameshd notify plevel)
     (let* ((ct (current-time))
 	   (cd (time-utc->date ct (* 9 60 60))) ;; JST(+9)
 	   (min (slot-ref cd 'minute)))
       (slot-set! cd 'minute (- min (modulo min 5)))
-      (let ((file (make-basename cd)))
-	(let loop1 ((wait 3))
+      (let* ((file (make-basename cd))
+	     (gif-file (make-filename file ".gif"))
+	     (rgb-file (make-filename file ".rgb")))
+	(let loop1 ((wait 6)) ;; wait 60sec at most
 	  (when (= wait 0)
-		(display "Can't get a rain map.\n")
-		(sys-remove (make-filename file ".gif")) (exit 1))
-	  (if (not (get-amesh-image (make-filename file ".gif")))
+		(print "Can't get a rain map.")
+		(sys-remove gif-file) (exit 1))
+	  (if (not (get-amesh-image gif-file))
 	      (begin (sys-sleep 10) (loop1 (- wait 1)))))
-	(convert-gif-to-rgb (make-filename file ".gif") (make-filename file ".rgb"))
-	(read-rgb-to-uvec (make-filename file ".rgb") rgb-uvector)
-	(sys-remove (make-filename file ".gif"))
-	(sys-remove (make-filename file ".rgb"))
+	(log "Get ~a at ~a\n" gif-file (make-basename (time-utc->date ct)))
+	(convert-gif-to-rgb gif-file rgb-file)
+	(read-rgb-to-uvec rgb-file rgb-uvector)
+	(unless *debug* (sys-remove gif-file))
+	(unless *debug* (sys-remove rgb-file))
 	(convert-rgb-to-rain-level rgb-uvector rain-uvector)
-	(let ((level (check-rain-circle position-pixel-x
-					position-pixel-y radius-pixel-x)))
-	  (if (= plevel 0)
-	      (when (< 0 level)
-		    (send-notify (make-start-message (/ radius 1000) level)))
-	      (if (= 0 level)
-		  (send-notify (make-stop-message (/ radius 1000)))
-		  (begin
-		    (when (< plevel level)
-			  (send-notify (make-change-higher-message (/ radius 1000)
-								   level)))
-		    (when (> plevel level)
-			  (send-notify (make-change-lower-message (/ radius 1000)
-								  level))))))
-	  (sys-sleep 300)
-	  (ameshd #f level)))))
-  (ameshd #t 0))
+	(receive
+	 (level sum) (check-rain-circle position-pixel-x
+					position-pixel-y radius-pixel-x)
+	 (when (< sum notify-rainfall-threshold) (set! level 0))
+	 (log "level ~d to ~d sum ~d\n" plevel level sum)
+	 (if (= plevel 0)
+	     (when (and notify (< 0 level)) (send-notify 'start level))
+	     (if (= 0 level)
+		 (send-notify 'stop level)
+		 (begin
+		   (when (< plevel level) (send-notify 'change-higher level))
+		   (when (> plevel level) (send-notify 'change-lower level)))))
+	 (sys-sleep (* (- 5 (modulo min 5)) 60))
+	 (ameshd #t level)))))
+  (ameshd notify-at-program-start 0))
+
+(define (usage name rv)
+  (format #t "usage: ~a -[dhtV]\n" name) (exit rv))
+
+(define (version)
+  (format #t "ameshd version ~a\n" *ameshd-version*) (exit 0))
 
 (define (main args)
-  (ameshd))
+  (let-args (cdr args)
+	    ((version "V|version" => (cut version))
+	     (debug "d|debug" => (cut debug-init))
+	     (test-file "t|test=s")
+	     (help "h|help" => (cut usage (car args) 0))
+	     (else (opt . _) (print "Unknown option :" opt) (usage (car args) 1))
+	     . args)
+	    (when test-file (amesh-test test-file) (exit 0))
+	    (ameshd)))
